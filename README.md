@@ -33,6 +33,49 @@ You can change these at the top of `ddos-guard.sh`:
 - `THRESHOLD_PER_IP`
 - `BAN_SECONDS`
 
+
+## Install Guide
+
+### 1) Clone repository
+```bash
+git clone https://github.com/ek-mc/mini-firewall.git
+cd mini-firewall
+```
+
+### 2) Install dependencies
+- Requires Linux with:
+  - `ipset`
+  - `iptables`
+  - `ss` (from `iproute2`)
+
+On Debian/Ubuntu:
+```bash
+sudo apt-get update
+sudo apt-get install -y ipset iptables iproute2
+```
+
+### 3) Configure thresholds (optional)
+Edit `ddos-guard.sh`:
+- `PROTECTED_PORTS`
+- `THRESHOLD_PER_IP`
+- `BAN_SECONDS`
+
+### 4) Install cron job
+```bash
+sudo bash install-cron.sh
+```
+
+### 5) Verify
+```bash
+sudo crontab -l | grep ddos-guard.sh
+sudo tail -n 50 /var/log/ddos-guard.log
+```
+
+### 6) Uninstall (if needed)
+```bash
+sudo bash uninstall.sh
+```
+
 ## Logs and state
 - Log file: `/var/log/ddos-guard.log`
 - State dir: `/var/lib/ddos-guard`
