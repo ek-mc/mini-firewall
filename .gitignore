@@ -1,0 +1,14 @@
+# Local/runtime
+*.log
+.env
+.env.*
+!.env.example
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Firewall runtime artifacts
+state/
+*.pid
