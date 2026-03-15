@@ -47,3 +47,6 @@ You can change these at the top of `ddos-guard.sh`:
 
 ## Changelog
 See [CHANGELOG.md](CHANGELOG.md).
+
+## License
+MIT — see [LICENSE](LICENSE).
