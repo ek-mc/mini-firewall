@@ -5,7 +5,7 @@ Minimal cron-based anti-flood firewall guard for Linux servers using **ipset + i
 > Designed to block obvious abusive connection bursts with short temporary bans.
 
 ## Status
-- Version: **v0.1.0**
+- Version: **v0.2.0**
 - License: MIT
 - Latest release: https://github.com/ek-mc/mini-firewall/releases/latest
 
@@ -13,7 +13,10 @@ Minimal cron-based anti-flood firewall guard for Linux servers using **ipset + i
 - Runs every minute via cron.
 - Scans active TCP connections to protected ports (default: `80,443`).
 - Bans high-connection public IPs via `ipset` + `iptables`.
-- Auto-unbans after TTL (default: 15 minutes).
+- Uses **native ipset timeout** for auto-unban (default: 15 minutes).
+- Supports **whitelist** file to skip trusted IPs.
+- Supports `--dry-run` mode.
+- Supports `--status` mode.
 - Logs actions to `/var/log/ddos-guard.log`.
 
 ## Files
@@ -33,6 +36,14 @@ You can change these at the top of `ddos-guard.sh`:
 - `THRESHOLD_PER_IP`
 - `BAN_SECONDS`
 
+## Whitelist
+File: `/etc/ddos-guard/whitelist.txt`
+
+Add one trusted public IP per line, for example:
+```txt
+1.2.3.4
+5.6.7.8
+```
 
 ## Install Guide
 
@@ -47,11 +58,12 @@ cd mini-firewall
   - `ipset`
   - `iptables`
   - `ss` (from `iproute2`)
+  - `flock` (from `util-linux`)
 
 On Debian/Ubuntu:
 ```bash
 sudo apt-get update
-sudo apt-get install -y ipset iptables iproute2
+sudo apt-get install -y ipset iptables iproute2 util-linux
 ```
 
 ### 3) Configure thresholds (optional)
@@ -69,16 +81,23 @@ sudo bash install-cron.sh
 ```bash
 sudo crontab -l | grep ddos-guard.sh
 sudo tail -n 50 /var/log/ddos-guard.log
+sudo bash ddos-guard.sh --status
 ```
 
-### 6) Uninstall (if needed)
+### 6) Dry run test
+```bash
+sudo bash ddos-guard.sh --dry-run
+```
+
+### 7) Uninstall (if needed)
 ```bash
 sudo bash uninstall.sh
 ```
 
 ## Logs and state
 - Log file: `/var/log/ddos-guard.log`
-- State dir: `/var/lib/ddos-guard`
+- Lock file: `/var/run/ddos-guard.lock`
+- Whitelist: `/etc/ddos-guard/whitelist.txt`
 
 ## Notes (important)
 - This is a minimal defensive script, **not** a full DDoS platform.
