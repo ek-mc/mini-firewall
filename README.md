@@ -5,7 +5,7 @@ Minimal cron-based anti-flood firewall guard for Linux servers using **ipset + i
 > Designed to block obvious abusive connection bursts with short temporary bans.
 
 ## Status
-- Version: **v0.2.0**
+- Version: **v0.3.0**
 - License: MIT
 - Latest release: https://github.com/ek-mc/mini-firewall/releases/latest
 
@@ -17,6 +17,8 @@ Minimal cron-based anti-flood firewall guard for Linux servers using **ipset + i
 - Supports **whitelist** file to skip trusted IPs.
 - Supports `--dry-run` mode.
 - Supports `--status` mode.
+- Supports `--metrics` mode and writes Prometheus-style snapshot to `/var/lib/ddos-guard/metrics.prom`.
+- Optional webhook alerts on ban events via `ALERT_WEBHOOK_URL` env var.
 - Logs actions to `/var/log/ddos-guard.log`.
 
 ## Files
@@ -43,6 +45,12 @@ Add one trusted public IP per line, for example:
 ```txt
 1.2.3.4
 5.6.7.8
+```
+
+## Optional webhook alerts
+Set an environment variable before running script (or in cron wrapper):
+```bash
+export ALERT_WEBHOOK_URL="https://example.com/webhook"
 ```
 
 ## Install Guide
@@ -89,7 +97,13 @@ sudo bash ddos-guard.sh --status
 sudo bash ddos-guard.sh --dry-run
 ```
 
-### 7) Uninstall (if needed)
+### 7) Metrics snapshot
+```bash
+sudo bash ddos-guard.sh --metrics
+cat /var/lib/ddos-guard/metrics.prom
+```
+
+### 8) Uninstall (if needed)
 ```bash
 sudo bash uninstall.sh
 ```
@@ -98,6 +112,8 @@ sudo bash uninstall.sh
 - Log file: `/var/log/ddos-guard.log`
 - Lock file: `/var/run/ddos-guard.lock`
 - Whitelist: `/etc/ddos-guard/whitelist.txt`
+- Stats file: `/var/lib/ddos-guard/stats.env`
+- Metrics file: `/var/lib/ddos-guard/metrics.prom`
 
 ## Notes (important)
 - This is a minimal defensive script, **not** a full DDoS platform.

@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-03-20
+
+### Added
+- `--metrics` mode with Prometheus-style metrics output.
+- Persistent counters (`run_count`, `ban_count`, `last_run`) in `/var/lib/ddos-guard/stats.env`.
+- Optional webhook alert on bans via `ALERT_WEBHOOK_URL`.
+
+### Changed
+- Extended operational observability (`status` + metrics snapshot file).
+
 ## [0.2.0] - 2026-03-20
 
 ### Added
