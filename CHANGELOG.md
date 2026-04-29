@@ -30,3 +30,8 @@ All notable changes to this project will be documented in this file.
 - Initial release.
 - Cron-based connection burst detection.
 - Auto-ban using ipset + iptables.
+
+## 2026-04-29
+
+- Added basic GitHub Actions CI workflow (`.github/workflows/basic-ci.yml`).
+- Maintenance: closed stale dependency PR queue for cleaner triage (where applicable).
