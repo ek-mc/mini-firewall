@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # Minimal cron-based connection flood guard
-# - Scans active TCP connections to protected ports
-# - If IP exceeds threshold, blocks via ipset+iptables (IPv4) and ip6tables+ipset (IPv6)
-# - Uses native ipset timeout (no manual bans file)
+# - Scans active TCP connections to protected ports via ss(8)
+# - If IP exceeds threshold, blocks via nftables native sets (IPv4 + IPv6)
+# - Uses nftables set element timeout (no manual bans file)
 # - Tracks repeat offenders and escalates to persistent blocklist after BAN_ESCALATE_THRESHOLD bans
 
 # ===== Config =====
@@ -18,10 +18,13 @@ CONFIG_DIR="/etc/ddos-guard"
 WHITELIST_FILE="$CONFIG_DIR/whitelist.txt"
 LOG_FILE="/var/log/ddos-guard.log"
 LOCK_FILE="/var/run/ddos-guard.lock"
-IPSET_NAME="ddos_block"
-IPSET6_NAME="ddos_block6"
-PERSISTENT_SET="ddos_persistent"
-PERSISTENT_SET6="ddos_persistent6"
+# nftables table / chain / set names
+NFT_TABLE="inet ddos_guard"
+NFT_CHAIN="input"
+NFT_SET_TMP4="ddos_block4"
+NFT_SET_TMP6="ddos_block6"
+NFT_SET_PERSIST4="ddos_persist4"
+NFT_SET_PERSIST6="ddos_persist6"
 OFFENDER_DIR="$STATE_DIR/offenders"
 METRICS_FILE="$STATE_DIR/metrics.prom"
 STATS_FILE="$STATE_DIR/stats.env"
@@ -38,8 +41,8 @@ usage() {
 Usage: ddos-guard.sh [--dry-run] [--status] [--metrics] [--help]
 
 Options:
-  --dry-run   Detect and log what would be banned, without changing firewall/ipset
-  --status    Show current set/rule status and recent log tail
+  --dry-run   Detect and log what would be banned, without changing firewall
+  --status    Show current nftables set sizes and recent log tail
   --metrics   Print + write Prometheus-style metrics snapshot
   --help      Show this help
 USAGE
@@ -70,60 +73,74 @@ ensure_lock(){
   fi
 }
 
-ensure_firewall(){
-  command -v ipset >/dev/null 2>&1 || { echo "Missing ipset"; exit 1; }
-  command -v iptables >/dev/null 2>&1 || { echo "Missing iptables"; exit 1; }
+# ─── nftables helpers ─────────────────────────────────────────────────────────
 
-  # IPv4 temporary ban set
-  ipset list "$IPSET_NAME" >/dev/null 2>&1 || ipset create "$IPSET_NAME" hash:ip timeout "$BAN_SECONDS" -exist
-
-  # IPv4 persistent ban set (no timeout — manual removal only)
-  ipset list "$PERSISTENT_SET" >/dev/null 2>&1 || ipset create "$PERSISTENT_SET" hash:ip -exist
-
-  if ! iptables -C INPUT -m set --match-set "$IPSET_NAME" src -j DROP 2>/dev/null; then
-    if (( DRY_RUN == 1 )); then
-      log "DRYRUN would_insert_iptables_rule ipset=$IPSET_NAME"
-    else
-      iptables -I INPUT -m set --match-set "$IPSET_NAME" src -j DROP
-      log "Inserted INPUT drop rule for ipset:$IPSET_NAME"
-    fi
-  fi
-
-  if ! iptables -C INPUT -m set --match-set "$PERSISTENT_SET" src -j DROP 2>/dev/null; then
-    if (( DRY_RUN == 1 )); then
-      log "DRYRUN would_insert_iptables_rule ipset=$PERSISTENT_SET"
-    else
-      iptables -I INPUT -m set --match-set "$PERSISTENT_SET" src -j DROP
-      log "Inserted INPUT drop rule for ipset:$PERSISTENT_SET"
-    fi
-  fi
-
-  # IPv6 support (optional — skip gracefully if ip6tables unavailable)
-  if command -v ip6tables >/dev/null 2>&1; then
-    ipset list "$IPSET6_NAME" >/dev/null 2>&1 || \
-      ipset create "$IPSET6_NAME" hash:ip family inet6 timeout "$BAN_SECONDS" -exist
-    ipset list "$PERSISTENT_SET6" >/dev/null 2>&1 || \
-      ipset create "$PERSISTENT_SET6" hash:ip family inet6 -exist
-
-    if ! ip6tables -C INPUT -m set --match-set "$IPSET6_NAME" src -j DROP 2>/dev/null; then
-      if (( DRY_RUN == 1 )); then
-        log "DRYRUN would_insert_ip6tables_rule ipset=$IPSET6_NAME"
-      else
-        ip6tables -I INPUT -m set --match-set "$IPSET6_NAME" src -j DROP
-        log "Inserted INPUT drop rule for ipset6:$IPSET6_NAME"
-      fi
-    fi
-
-    if ! ip6tables -C INPUT -m set --match-set "$PERSISTENT_SET6" src -j DROP 2>/dev/null; then
-      if (( DRY_RUN == 1 )); then
-        log "DRYRUN would_insert_ip6tables_rule ipset=$PERSISTENT_SET6"
-      else
-        ip6tables -I INPUT -m set --match-set "$PERSISTENT_SET6" src -j DROP
-        log "Inserted INPUT drop rule for ipset6:$PERSISTENT_SET6"
-      fi
-    fi
-  fi
+# Check whether the ddos_guard table already exists
+_nft_table_exists(){
+  nft list table inet ddos_guard >/dev/null 2>&1
 }
+
+# Return the current element count of a named set
+_nft_set_size(){
+  local set_name="$1"
+  nft list set inet ddos_guard "$set_name" 2>/dev/null \
+    | grep -c 'elements = {' || echo 0
+  # More reliable: count comma-separated entries
+  nft list set inet ddos_guard "$set_name" 2>/dev/null \
+    | awk '/elements = \{/{found=1} found{print}' \
+    | grep -oE '[0-9a-fA-F:.]+' \
+    | wc -l || echo 0
+}
+
+ensure_firewall(){
+  command -v nft >/dev/null 2>&1 || { echo "Missing nft (nftables)"; exit 1; }
+
+  if _nft_table_exists; then
+    return 0
+  fi
+
+  if (( DRY_RUN == 1 )); then
+    log "DRYRUN would_create_nftables_table table='inet ddos_guard'"
+    return
+  fi
+
+  # Create the full table, sets, chain and drop rules in one atomic nft transaction
+  nft -f - <<NFT
+table inet ddos_guard {
+  # Temporary ban sets — entries expire automatically after BAN_SECONDS
+  set ${NFT_SET_TMP4} {
+    type ipv4_addr
+    flags dynamic, timeout
+    timeout ${BAN_SECONDS}s
+  }
+  set ${NFT_SET_TMP6} {
+    type ipv6_addr
+    flags dynamic, timeout
+    timeout ${BAN_SECONDS}s
+  }
+  # Persistent ban sets — no timeout, manual removal only
+  set ${NFT_SET_PERSIST4} {
+    type ipv4_addr
+    flags interval
+  }
+  set ${NFT_SET_PERSIST6} {
+    type ipv6_addr
+    flags interval
+  }
+  chain ${NFT_CHAIN} {
+    type filter hook input priority 0; policy accept;
+    ip  saddr @${NFT_SET_TMP4}     drop
+    ip6 saddr @${NFT_SET_TMP6}     drop
+    ip  saddr @${NFT_SET_PERSIST4} drop
+    ip6 saddr @${NFT_SET_PERSIST6} drop
+  }
+}
+NFT
+
+  log "Created nftables table 'inet ddos_guard' with sets and drop rules"
+}
+
+# ─── Stats ────────────────────────────────────────────────────────────────────
 
 load_stats(){
   if [[ -f "$STATS_FILE" ]]; then
@@ -143,6 +160,8 @@ LAST_RUN_TS=$LAST_RUN_TS
 STATS
 }
 
+# ─── Webhook ──────────────────────────────────────────────────────────────────
+
 send_alert(){
   local msg="$1"
   [[ -n "$ALERT_WEBHOOK_URL" ]] || return 0
@@ -151,6 +170,8 @@ send_alert(){
     -d "{\"text\":\"$msg\"}" \
     "$ALERT_WEBHOOK_URL" >/dev/null 2>&1 || true
 }
+
+# ─── IP classification ────────────────────────────────────────────────────────
 
 is_public_ipv4(){
   local ip="$1"
@@ -165,16 +186,10 @@ is_public_ipv4(){
 
 is_public_ipv6(){
   local ip="$1"
-  # Must contain at least one colon to be IPv6
   [[ "$ip" == *:* ]] || return 1
-  # Strip brackets if present (ss output can include them)
-  ip="${ip#[}"
-  ip="${ip%]}"
-  # Loopback
+  ip="${ip#[}"; ip="${ip%]}"
   [[ "$ip" == "::1" ]] && return 1
-  # Link-local fe80::/10
   [[ "${ip,,}" =~ ^fe8 ]] && return 1
-  # Unique-local fc00::/7
   [[ "${ip,,}" =~ ^f[cd] ]] && return 1
   return 0
 }
@@ -186,13 +201,8 @@ is_whitelisted(){
 }
 
 # ─── Repeat-offender escalation ───────────────────────────────────────────────
-# Each banned IP gets a file under $OFFENDER_DIR/<ip_escaped> containing
-# newline-separated Unix timestamps of recent bans.
-# If the count within ESCALATE_WINDOW_SECONDS reaches BAN_ESCALATE_THRESHOLD,
-# the IP is added to the persistent set and an escalation alert is sent.
 
 _ip_to_filename(){
-  # Replace characters unsafe for filenames (colons in IPv6) with underscores
   echo "${1//[:\/ ]/_}"
 }
 
@@ -203,39 +213,31 @@ record_and_check_escalation(){
   local now
   now=$(date +%s)
   local cutoff=$(( now - ESCALATE_WINDOW_SECONDS ))
-
-  # Append current timestamp
   echo "$now" >> "$fname"
-
-  # Count bans within the window
   local recent_count
   recent_count=$(awk -v cutoff="$cutoff" '$1 >= cutoff' "$fname" | wc -l)
-
-  if (( recent_count >= BAN_ESCALATE_THRESHOLD )); then
-    return 0  # escalate
-  fi
-  return 1  # normal ban only
+  (( recent_count >= BAN_ESCALATE_THRESHOLD ))
 }
 
 escalate_ip(){
   local ip="$1" count="$2"
-  local is_v6=0
-  [[ "$ip" == *:* ]] && is_v6=1
 
   if (( DRY_RUN == 1 )); then
     log "DRYRUN ESCALATE ip=$ip count=$count (persistent)"
     return
   fi
 
-  if (( is_v6 == 1 )) && command -v ip6tables >/dev/null 2>&1; then
-    ipset add "$PERSISTENT_SET6" "$ip" -exist
-    log "ESCALATE ip=$ip count=$count added to persistent set6:$PERSISTENT_SET6"
+  if [[ "$ip" == *:* ]]; then
+    nft add element inet ddos_guard "${NFT_SET_PERSIST6}" "{ ${ip} }"
+    log "ESCALATE ip=$ip count=$count added to nft set ${NFT_SET_PERSIST6}"
   else
-    ipset add "$PERSISTENT_SET" "$ip" -exist
-    log "ESCALATE ip=$ip count=$count added to persistent set:$PERSISTENT_SET"
+    nft add element inet ddos_guard "${NFT_SET_PERSIST4}" "{ ${ip} }"
+    log "ESCALATE ip=$ip count=$count added to nft set ${NFT_SET_PERSIST4}"
   fi
   send_alert "mini-firewall ESCALATE (persistent ban) ip=$ip count=$count host=$(hostname)"
 }
+
+# ─── Ban ──────────────────────────────────────────────────────────────────────
 
 ban_ip(){
   local ip="$1" count="$2"
@@ -250,39 +252,38 @@ ban_ip(){
     return
   fi
 
-  local is_v6=0
-  [[ "$ip" == *:* ]] && is_v6=1
-
-  if (( is_v6 == 1 )) && command -v ip6tables >/dev/null 2>&1; then
-    ipset add "$IPSET6_NAME" "$ip" timeout "$BAN_SECONDS" -exist
+  # nftables set elements accept per-element timeout override
+  if [[ "$ip" == *:* ]]; then
+    nft add element inet ddos_guard "${NFT_SET_TMP6}" \
+      "{ ${ip} timeout ${BAN_SECONDS}s }"
   else
-    ipset add "$IPSET_NAME" "$ip" timeout "$BAN_SECONDS" -exist
+    nft add element inet ddos_guard "${NFT_SET_TMP4}" \
+      "{ ${ip} timeout ${BAN_SECONDS}s }"
   fi
 
   BAN_COUNT=$((BAN_COUNT + 1))
   log "BAN ip=$ip count=$count ttl=${BAN_SECONDS}s"
   send_alert "mini-firewall BAN ip=$ip count=$count ttl=${BAN_SECONDS}s host=$(hostname)"
 
-  # Check for escalation to persistent block
   if record_and_check_escalation "$ip"; then
     escalate_ip "$ip" "$count"
   fi
 }
 
+# ─── Scan ─────────────────────────────────────────────────────────────────────
+
 scan_and_ban(){
   local ports_regex
   ports_regex=$(echo "$PROTECTED_PORTS" | sed 's/,/|/g')
 
-  # Count current established/syn-recv remote IPs hitting protected local ports
-  # ss output for IPv4: "ESTAB 0 0 0.0.0.0:443 1.2.3.4:54321"  -> field 5 is remote addr
-  # ss output for IPv6: "ESTAB 0 0 [::]:443   [2001:db8::1]:54321" -> field 5 is remote addr
+  # ss -Hnt: no header, TCP only, numeric ports
+  # state established,syn-recv: only active connections
+  # field 5 is the remote address:port
   ss -Hnt state established,syn-recv '( sport = :'"$ports_regex"' )' 2>/dev/null \
     | awk '{print $5}' \
     | sed 's/\[//g;s/\]//g' \
     | awk -F':' '
-        # IPv6 addresses contain multiple colons; NF>2 means IPv6
         NF > 2 { addr=""; for(i=1;i<NF;i++) addr=addr (i>1?":":"") $i; print addr; next }
-        # IPv4: last field is port, second-to-last is IP
         { print $(NF-1) }
       ' \
     | sort | uniq -c \
@@ -296,19 +297,24 @@ scan_and_ban(){
       done
 }
 
+# ─── Metrics ──────────────────────────────────────────────────────────────────
+
+_nft_count_elements(){
+  # Count IPs in a named nftables set
+  local set_name="$1"
+  nft list set inet ddos_guard "$set_name" 2>/dev/null \
+    | awk '/elements = \{/{p=1} p' \
+    | grep -oE '[0-9a-fA-F:]+\.[0-9a-fA-F:]+|[0-9a-fA-F:]{2,}' \
+    | wc -l || echo 0
+}
+
 write_metrics(){
-  local members=0 members6=0 persistent=0 persistent6=0
-  if ipset list "$IPSET_NAME" >/dev/null 2>&1; then
-    members=$(ipset list "$IPSET_NAME" | awk '/^Number of entries:/ {print $4}')
-  fi
-  if ipset list "$IPSET6_NAME" >/dev/null 2>&1; then
-    members6=$(ipset list "$IPSET6_NAME" | awk '/^Number of entries:/ {print $4}')
-  fi
-  if ipset list "$PERSISTENT_SET" >/dev/null 2>&1; then
-    persistent=$(ipset list "$PERSISTENT_SET" | awk '/^Number of entries:/ {print $4}')
-  fi
-  if ipset list "$PERSISTENT_SET6" >/dev/null 2>&1; then
-    persistent6=$(ipset list "$PERSISTENT_SET6" | awk '/^Number of entries:/ {print $4}')
+  local tmp4=0 tmp6=0 persist4=0 persist6=0
+  if _nft_table_exists; then
+    tmp4=$(_nft_count_elements "$NFT_SET_TMP4")
+    tmp6=$(_nft_count_elements "$NFT_SET_TMP6")
+    persist4=$(_nft_count_elements "$NFT_SET_PERSIST4")
+    persist6=$(_nft_count_elements "$NFT_SET_PERSIST6")
   fi
 
   cat > "$METRICS_FILE" <<METRICS
@@ -323,16 +329,16 @@ ddos_guard_ban_count $BAN_COUNT
 ddos_guard_last_run_unix $LAST_RUN_TS
 # HELP ddos_guard_blocklist_size Current number of IPs in temporary IPv4 blocklist
 # TYPE ddos_guard_blocklist_size gauge
-ddos_guard_blocklist_size ${members:-0}
+ddos_guard_blocklist_size ${tmp4}
 # HELP ddos_guard_blocklist6_size Current number of IPs in temporary IPv6 blocklist
 # TYPE ddos_guard_blocklist6_size gauge
-ddos_guard_blocklist6_size ${members6:-0}
+ddos_guard_blocklist6_size ${tmp6}
 # HELP ddos_guard_persistent_size Current number of IPs in persistent IPv4 blocklist
 # TYPE ddos_guard_persistent_size gauge
-ddos_guard_persistent_size ${persistent:-0}
+ddos_guard_persistent_size ${persist4}
 # HELP ddos_guard_persistent6_size Current number of IPs in persistent IPv6 blocklist
 # TYPE ddos_guard_persistent6_size gauge
-ddos_guard_persistent6_size ${persistent6:-0}
+ddos_guard_persistent6_size ${persist6}
 METRICS
 }
 
@@ -341,47 +347,34 @@ show_metrics(){
   cat "$METRICS_FILE"
 }
 
+# ─── Status ───────────────────────────────────────────────────────────────────
+
 show_status(){
-  local members=0 members6=0 persistent=0 persistent6=0
-  if ipset list "$IPSET_NAME" >/dev/null 2>&1; then
-    members=$(ipset list "$IPSET_NAME" | awk '/^Number of entries:/ {print $4}')
-  fi
-  if ipset list "$IPSET6_NAME" >/dev/null 2>&1; then
-    members6=$(ipset list "$IPSET6_NAME" | awk '/^Number of entries:/ {print $4}')
-  fi
-  if ipset list "$PERSISTENT_SET" >/dev/null 2>&1; then
-    persistent=$(ipset list "$PERSISTENT_SET" | awk '/^Number of entries:/ {print $4}')
-  fi
-  if ipset list "$PERSISTENT_SET6" >/dev/null 2>&1; then
-    persistent6=$(ipset list "$PERSISTENT_SET6" | awk '/^Number of entries:/ {print $4}')
+  local tmp4=0 tmp6=0 persist4=0 persist6=0
+  if _nft_table_exists; then
+    tmp4=$(_nft_count_elements "$NFT_SET_TMP4")
+    tmp6=$(_nft_count_elements "$NFT_SET_TMP6")
+    persist4=$(_nft_count_elements "$NFT_SET_PERSIST4")
+    persist6=$(_nft_count_elements "$NFT_SET_PERSIST6")
   fi
 
-  echo "mini-firewall status"
-  echo "- set (ipv4 temp):       $IPSET_NAME  [${members:-0} entries]"
-  echo "- set (ipv6 temp):       $IPSET6_NAME  [${members6:-0} entries]"
-  echo "- set (ipv4 persistent): $PERSISTENT_SET  [${persistent:-0} entries]"
-  echo "- set (ipv6 persistent): $PERSISTENT_SET6  [${persistent6:-0} entries]"
-  echo "- ban_seconds: $BAN_SECONDS"
-  echo "- threshold_per_ip: $THRESHOLD_PER_IP"
-  echo "- escalate_after: $BAN_ESCALATE_THRESHOLD bans in ${ESCALATE_WINDOW_SECONDS}s"
-  echo "- protected_ports: $PROTECTED_PORTS"
-  echo "- whitelist_file: $WHITELIST_FILE"
-  echo "- metrics_file: $METRICS_FILE"
+  echo "mini-firewall status (nftables backend)"
+  echo "- table:                 inet ddos_guard"
+  echo "- set (ipv4 temp):       ${NFT_SET_TMP4}  [${tmp4} entries]"
+  echo "- set (ipv6 temp):       ${NFT_SET_TMP6}  [${tmp6} entries]"
+  echo "- set (ipv4 persistent): ${NFT_SET_PERSIST4}  [${persist4} entries]"
+  echo "- set (ipv6 persistent): ${NFT_SET_PERSIST6}  [${persist6} entries]"
+  echo "- ban_seconds:           $BAN_SECONDS"
+  echo "- threshold_per_ip:      $THRESHOLD_PER_IP"
+  echo "- escalate_after:        $BAN_ESCALATE_THRESHOLD bans in ${ESCALATE_WINDOW_SECONDS}s"
+  echo "- protected_ports:       $PROTECTED_PORTS"
+  echo "- whitelist_file:        $WHITELIST_FILE"
+  echo "- metrics_file:          $METRICS_FILE"
 
-  if iptables -C INPUT -m set --match-set "$IPSET_NAME" src -j DROP 2>/dev/null; then
-    echo "- iptables_rule (ipv4 temp): present"
+  if _nft_table_exists; then
+    echo "- nftables_table:        present"
   else
-    echo "- iptables_rule (ipv4 temp): missing"
-  fi
-
-  if command -v ip6tables >/dev/null 2>&1; then
-    if ip6tables -C INPUT -m set --match-set "$IPSET6_NAME" src -j DROP 2>/dev/null; then
-      echo "- ip6tables_rule (ipv6 temp): present"
-    else
-      echo "- ip6tables_rule (ipv6 temp): missing"
-    fi
-  else
-    echo "- ip6tables: not available (IPv6 blocking disabled)"
+    echo "- nftables_table:        missing (run without --status to initialise)"
   fi
 
   if [[ -f "$LOG_FILE" ]]; then
@@ -390,6 +383,8 @@ show_status(){
     tail -n 10 "$LOG_FILE" || true
   fi
 }
+
+# ─── Args ─────────────────────────────────────────────────────────────────────
 
 parse_args(){
   while [[ $# -gt 0 ]]; do
@@ -424,6 +419,8 @@ parse_args(){
     esac
   done
 }
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
 
 main(){
   need_root
