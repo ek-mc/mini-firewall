@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-05-23
+
+### Changed
+- **Firewall backend: `iptables`/`ipset` → `nftables` native sets** (`ddos-guard.sh`).
+  - A single `inet ddos_guard` table is created atomically via `nft -f -` on first
+    run. The table contains four sets and four drop rules — replacing the previous
+    four separate `ipset create` + `iptables -I` calls.
+  - Temporary ban sets (`ddos_block4`, `ddos_block6`) use `flags dynamic, timeout`
+    so entries expire automatically without a separate cleanup job.
+  - Persistent ban sets (`ddos_persist4`, `ddos_persist6`) use `flags interval`
+    for efficient CIDR-range support in future.
+  - `ban_ip` and `escalate_ip` now call `nft add element` with a per-element
+    `timeout` override instead of `ipset add … timeout`.
+  - `ensure_firewall` is idempotent: if the table already exists the function
+    returns immediately (no duplicate-rule risk).
+  - `uninstall.sh` now calls `nft delete table inet ddos_guard` which atomically
+    removes all sets and rules in one command.
+  - `--status` output updated to show nftables table and set names.
+  - Dependency on `ipset`, `iptables`, and `ip6tables` binaries removed;
+    only `nft` (package `nftables`) is required.
+
+### Notes
+- Requires Linux kernel ≥ 3.13 and the `nftables` package (`apt install nftables`
+  / `dnf install nftables`). All major distributions since 2019 ship it by default.
+- Existing `ipset`/`iptables` rules from v0.4.0 are **not** automatically removed
+  on upgrade. Run the old `uninstall.sh` before upgrading, or remove them manually:
+  ```
+  iptables -D INPUT -m set --match-set ddos_block src -j DROP
+  ipset destroy ddos_block ddos_block6 ddos_persistent ddos_persistent6
+  ```
+
 ## [0.4.0] - 2026-05-16
 
 ### Added
